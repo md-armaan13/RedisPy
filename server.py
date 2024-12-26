@@ -224,7 +224,7 @@ def handle_info_command(conn , args) :
         master_replid = config["master_replid"]
         master_repl_offset = config["master_repl_offset"]
 
-        response_string = f"# Replication\nrole:{role}\nmaster_replid:{master_replid}\nmaster_repl_offset:{master_repl_offset}"
+        response_string = f"# Replication\nrole:{role}\nmaster_replid:{master_replid}\nmaster_repl_offset:{master_repl_offset}\n"
 
         # RESP Bulk String format: $<length>\r\n<response_string>
         response = f"${len(response_string)}\r\n{response_string}\r\n"
@@ -233,7 +233,116 @@ def handle_info_command(conn , args) :
         # If other sections are requested, respond with an empty bulk string
         conn.sendall(b"-ERR Wrong arguments for 'info' command\r\n")
 
+def handle_replconf_command(conn, args):
+    """
+    Handles the REPLCONF command by responding with +OK\r\n
+    """
+    if len(args) != 2:
+        conn.sendall(b"-ERR Wrong number of arguments for REPLCONF\r\n")
+        return
 
+    key = args[0]
+    value = args[1]
+    print(f"Received REPLCONF command: {key} {value}")
+
+    # For this stage, simply respond with +OK\r\n
+    conn.sendall(b"+OK\r\n")
+def handle_psync_command(conn, args):
+    """
+    Handles the PSYNC command by responding with +FULLRESYNC <REPL_ID> 0\r\n
+    """
+    if len(args) != 2:
+        conn.sendall(b"-ERR Wrong number of arguments for PSYNC\r\n")
+        return
+
+    repl_id = args[0]
+    repl_offset = args[1]
+
+    # For this stage, respond with +FULLRESYNC <REPL_ID> 0\r\n
+    # If repl_id is "?", and repl_offset is "-1", perform a full resync
+    master_replid = config["master_replid"]
+    if repl_id == "?" and repl_offset == "-1":
+        response = f"+FULLRESYNC {master_replid} 0\r\n"
+        conn.sendall(response.encode())
+        print(f"Handled PSYNC command with repl_id={repl_id}, repl_offset={repl_offset}")
+
+        rdb_path = os.path.join(config['dir'], config['dbfilename'])
+
+        if os.path.exists(rdb_path):
+            try:
+                with open(rdb_path, 'rb') as rdb_file:
+                    rdb_content = rdb_file.read()
+                rdb_length = len(rdb_content)
+                # Prepare the RDB file in the specified format
+                rdb_response = f"${rdb_length}\r\n".encode() + rdb_content
+                conn.sendall(rdb_response)
+                print(f"Sent RDB file ({rdb_length} bytes) to replica.")
+            except Exception as e:
+                conn.sendall(b"-ERR Failed to read RDB file\r\n")
+                print(f"Error reading RDB file: {e}")
+                
+    else:
+        # For simplicity, only handle the initial PSYNC ? -1
+        conn.sendall(b"-ERR Unsupported PSYNC arguments\r\n")
+        print(f"Received unsupported PSYNC arguments: repl_id={repl_id}, repl_offset={repl_offset}")
+
+
+def replica_handshake():
+    """
+    Handles the handshake process from the replica's side by connecting to the master,
+    sending PING, and then sending two REPLCONF commands.
+    """
+    master_host = config["master_host"]
+    master_port = int(config["master_port"])
+    replica_port = config["port"]
+
+    try:
+        with socket.create_connection((master_host, master_port)) as sock:
+            print(f"Connected to master at {master_host}:{master_port} for replication handshake.")
+
+            # === Part 1: Send PING ===
+            ping_command = "*1\r\n$4\r\nPING\r\n"
+            sock.sendall(ping_command.encode())
+            print("Sent PING to master.")
+
+            # Receive PONG response
+            response = sock.recv(1024).decode()
+            print(f"Received response from master: {response.strip()}")
+
+            # === Part 2: Send REPLCONF listening-port <PORT> ===
+            replconf_listening_port = f"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n${len(str(replica_port))}\r\n{replica_port}\r\n"
+            sock.sendall(replconf_listening_port.encode())
+            print(f"Sent REPLCONF listening-port {replica_port} to master.")
+
+            # Receive +OK response
+            response = sock.recv(1024).decode()
+            print(f"Received response from master: {response.strip()}")
+
+            # === Part 2: Send REPLCONF capa psync2 ===
+            replconf_capa = "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
+            sock.sendall(replconf_capa.encode())
+            print("Sent REPLCONF capa psync2 to master.")
+
+            # Receive +OK response
+            response = sock.recv(1024).decode()
+            print(f"Received response from master: {response.strip()}")
+
+            # === Part 3: Send PSYNC ? -1 ===
+            psync_command = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
+            sock.sendall(psync_command.encode())
+            print("Sent PSYNC ? -1 to master.")
+
+            # Receive +FULLRESYNC <REPL_ID> 0\r\n response
+            response = sock.recv(1024).decode()
+            print(f"Received response from master: {response.strip()}")
+
+            # For this stage, we can keep the connection open or close it.
+            # Here, we'll keep it open to simulate an ongoing replication connection.
+            # while True:
+            #     time.sleep(1)  # Keep the thread alive
+
+    except Exception as e:
+        print(f"Failed to connect to master {master_host}:{master_port} - {e}")
 
 def handle_client(conn, addr):
     with conn:
@@ -270,6 +379,10 @@ def handle_client(conn, addr):
                     handle_keys_command(conn, args)
                 elif command == "INFO" :
                     handle_info_command(conn , args)
+                elif command == "REPLCONF":
+                    handle_replconf_command(conn, args)
+                elif command == "PSYNC":
+                    handle_psync_command(conn, args)
                 elif command in ("QUIT", "EXIT"):
                     conn.sendall(b"+OK\r\n")
                     break  # Exit the loop
@@ -301,6 +414,7 @@ def main():
         # Update the configuration with command-line arguments
         config["dir"] = args.dir
         config["dbfilename"] = args.dbfilename
+        config["port"] = args.port or 6379
         port = args.port or 6379
 
         if args.replicaof:
@@ -325,6 +439,9 @@ def main():
             print("No RDB file found. Starting with an empty data store.")
         # Start the active expiration thread
         threading.Thread(target=active_expiration, daemon=True).start()
+
+        if config["role"] == "slave":
+            threading.Thread(target=replica_handshake, daemon=True).start()
 
         # Create and bind the server socket
         with socket.create_server(("localhost", int(port) )) as server_socket:
